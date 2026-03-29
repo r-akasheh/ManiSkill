@@ -51,12 +51,11 @@ def worker_init_fn(worker_id, base_seed=None):
 
 
 TARGET_KEY_TO_SOURCE_KEY = {
-    "states": "env_states",
-    "observations": "obs",
+    "states": "obs/state",
+    "observations": "obs",  # use 'obs' first, then extract 'sensor_data' later
     "success": "success",
-    "next_observations": "obs",
-    # 'dones': 'dones',
-    # 'rewards': 'rewards',
+    "terminated": "terminated",
+    "truncated": "truncated",
     "actions": "actions",
 }
 
@@ -71,7 +70,7 @@ def load_content_from_h5_file(file):
 
 
 def load_hdf5(
-    path,
+        path,
 ):
     print("Loading HDF5 file", path)
     file = File(path, "r")
@@ -96,15 +95,26 @@ def load_traj_hdf5(path, num_traj=None):
 
 
 def load_demo_dataset(
-    path, keys=["observations", "actions"], num_traj=None, concat=True
+        path, keys=["observations", "actions"], num_traj=None, concat=True
 ):
     # assert num_traj is None
     raw_data = load_traj_hdf5(path, num_traj)
     # raw_data has keys like: ['traj_0', 'traj_1', ...]
     # raw_data['traj_0'] has keys like: ['actions', 'dones', 'env_states', 'infos', ...]
     _traj = raw_data["traj_0"]
+
+    def get_nested(d, key_path):
+        keys = key_path.split('/')
+        for key in keys:
+            d = d[key]
+        return d
+
     for key in keys:
         source_key = TARGET_KEY_TO_SOURCE_KEY[key]
+        try:
+            get_nested(_traj, source_key)
+        except KeyError:
+            raise AssertionError(f"key: {source_key} not in traj_0")
         assert source_key in _traj, f"key: {source_key} not in traj_0: {_traj.keys()}"
     dataset = {}
     for target_key in keys:
@@ -114,13 +124,13 @@ def load_demo_dataset(
         dataset[target_key] = [raw_data[idx][source_key] for idx in raw_data]
         if isinstance(dataset[target_key][0], np.ndarray) and concat:
             if target_key in ["observations", "states"] and len(
-                dataset[target_key][0]
+                    dataset[target_key][0]
             ) > len(raw_data["traj_0"]["actions"]):
                 dataset[target_key] = np.concatenate(
                     [t[:-1] for t in dataset[target_key]], axis=0
                 )
             elif target_key in ["next_observations", "next_states"] and len(
-                dataset[target_key][0]
+                    dataset[target_key][0]
             ) > len(raw_data["traj_0"]["actions"]):
                 dataset[target_key] = np.concatenate(
                     [t[1:] for t in dataset[target_key]], axis=0
@@ -139,7 +149,7 @@ def load_demo_dataset(
     return dataset
 
 
-def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth = True):
+def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True):
     img_dict = obs["sensor_data"]
     ls = ["rgb"]
     if depth:
@@ -151,11 +161,12 @@ def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth = True)
         )  # (C, H, W) or (B, C, H, W)
         for key in ls
     }
-    if "depth" in new_img_dict and isinstance(new_img_dict['depth'], torch.Tensor): # MS2 vec env uses float16, but gym AsyncVecEnv uses float32
+    if "depth" in new_img_dict and isinstance(new_img_dict['depth'],
+                                              torch.Tensor):  # MS2 vec env uses float16, but gym AsyncVecEnv uses float32
         new_img_dict['depth'] = new_img_dict['depth'].to(torch.float16)
 
     # Unified version
-    states_to_stack = state_obs_extractor(obs)
+    states_to_stack = build_state_obs_extractor_from_h5(obs)
     for j in range(len(states_to_stack)):
         if states_to_stack[j].dtype == np.float64:
             states_to_stack[j] = states_to_stack[j].astype(np.float32)
@@ -177,7 +188,6 @@ def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth = True)
 
     if "depth" in new_img_dict:
         out_dict["depth"] = new_img_dict["depth"]
-
 
     return out_dict
 
@@ -204,6 +214,15 @@ def build_obs_space(env, depth_dtype, state_obs_extractor):
             ),
         }
     )
+
+
+def build_state_obs_extractor_from_h5(obs):
+    """
+    Extract state array from your HDF5 observation.
+    obs: the dict returned from your load_demo_dataset
+    """
+    # obs["state"] is already a numpy array of shape (state_dim,)
+    return [obs["state"]]
 
 
 def build_state_obs_extractor(env_id):
