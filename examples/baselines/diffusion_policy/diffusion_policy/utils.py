@@ -165,9 +165,30 @@ def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True):
                                               torch.Tensor):  # MS2 vec env uses float16, but gym AsyncVecEnv uses float32
         new_img_dict['depth'] = new_img_dict['depth'].to(torch.float16)
 
-    # Unified version
-    states_to_stack = build_state_obs_extractor_from_h5(obs)
+    # Flatten nested state structures (dict/list/tuple) into an ordered list of arrays.
+    # HDF5 demos may store agent state as nested dicts, not a single ndarray.
+    def _flatten_state_components(x):
+        if isinstance(x, dict):
+            out = []
+            for v in x.values():
+                out.extend(_flatten_state_components(v))
+            return out
+        if isinstance(x, (list, tuple)):
+            out = []
+            for v in x:
+                out.extend(_flatten_state_components(v))
+            return out
+        return [x]
+
+    raw_state_components = state_obs_extractor(obs)
+    states_to_stack = []
+    for component in raw_state_components:
+        states_to_stack.extend(_flatten_state_components(component))
+
     for j in range(len(states_to_stack)):
+        if isinstance(states_to_stack[j], torch.Tensor):
+            states_to_stack[j] = states_to_stack[j].detach().cpu().numpy()
+        states_to_stack[j] = np.asarray(states_to_stack[j])
         if states_to_stack[j].dtype == np.float64:
             states_to_stack[j] = states_to_stack[j].astype(np.float32)
     try:
@@ -175,11 +196,7 @@ def convert_obs(obs, concat_fn, transpose_fn, state_obs_extractor, depth=True):
     except:  # dirty fix for concat trajectory of states
         state = np.column_stack(states_to_stack)
     if state.dtype == np.float64:
-        for x in states_to_stack:
-            print(x.shape, x.dtype)
-        import pdb
-
-        pdb.set_trace()
+        state = state.astype(np.float32)
 
     out_dict = {
         "state": state,
@@ -221,11 +238,11 @@ def build_state_obs_extractor_from_h5(obs):
     Extract state array from your HDF5 observation.
     obs: the dict returned from your load_demo_dataset
     """
-    # obs["state"] is already a numpy array of shape (state_dim,)
-    return [obs["state"]]
+    # Keep the same extraction convention as build_state_obs_extractor.
+    return list(obs["agent"].values())
 
 
 def build_state_obs_extractor(env_id):
     # NOTE: You can tune/modify state observations specific to each environment here as you wish. By default we include all data
     # but in some use cases you might want to exclude e.g. obs["agent"]["qvel"] as qvel is not always something you query in the real world.
-    return lambda obs: list(obs["agent"].values()) + list(obs["extra"].values())
+    return lambda obs: list(obs["agent"].values())

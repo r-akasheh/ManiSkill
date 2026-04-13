@@ -243,6 +243,15 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         return len(self.slices)
 
 
+class AgentOnlyFlattenRGBDObservationWrapper(FlattenRGBDObservationWrapper):
+    """Flatten RGB(D) observations while excluding privileged `extra` state."""
+
+    def observation(self, observation: dict):
+        filtered_obs = dict(observation)
+        filtered_obs.pop("extra", None)
+        return super().observation(filtered_obs)
+
+
 class Agent(nn.Module):
     def __init__(self, env: VectorEnv, args: Args):
         super().__init__()
@@ -438,6 +447,7 @@ if __name__ == "__main__":
     assert args.max_episode_steps != None, "max_episode_steps must be specified as imitation learning algorithms task solve speed is dependent on the data you train on"
     env_kwargs["max_episode_steps"] = args.max_episode_steps
     other_kwargs = dict(obs_horizon=args.obs_horizon)
+    wrappers = [AgentOnlyFlattenRGBDObservationWrapper]
     envs = make_eval_envs(
         args.env_id,
         args.num_eval_envs,
@@ -445,7 +455,7 @@ if __name__ == "__main__":
         env_kwargs,
         other_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=[FlattenRGBDObservationWrapper],
+        wrappers=wrappers,
     )
 
     if args.track:
@@ -469,16 +479,6 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    obs_process_fn = partial(
-        convert_obs,
-        concat_fn=partial(np.concatenate, axis=-1),
-        transpose_fn=partial(
-            np.transpose, axes=(0, 3, 1, 2)
-        ),  # (B, H, W, C) -> (B, C, H, W)
-        state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth = "rgbd" in args.demo_path
-    )
-
     # create temporary env to get original observation space as AsyncVectorEnv (CPU parallelization) doesn't permit that
     tmp_env = gym.make(args.env_id, **env_kwargs)
     orignal_obs_space = tmp_env.observation_space
@@ -486,6 +486,16 @@ if __name__ == "__main__":
     include_rgb = tmp_env.unwrapped.obs_mode_struct.visual.rgb
     include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
     tmp_env.close()
+
+    obs_process_fn = partial(
+        convert_obs,
+        concat_fn=partial(np.concatenate, axis=-1),
+        transpose_fn=partial(
+            np.transpose, axes=(0, 3, 1, 2)
+        ),  # (B, H, W, C) -> (B, C, H, W)
+        state_obs_extractor=build_state_obs_extractor(args.env_id),
+        depth=include_depth,
+    )
 
     dataset = SmallDemoDataset_DiffusionPolicy(
         data_path=args.demo_path,
@@ -495,6 +505,12 @@ if __name__ == "__main__":
         include_depth=include_depth,
         device=device,
         num_traj=args.num_demos
+    )
+    dataset_state_dim = dataset.trajectories["observations"][0]["state"].shape[-1]
+    env_state_dim = envs.single_observation_space["state"].shape[-1]
+    assert dataset_state_dim == env_state_dim, (
+        f"State dim mismatch between demos and env wrapper: demo={dataset_state_dim}, env={env_state_dim}. "
+        "Check state extraction and privileged-key filtering."
     )
     sampler = RandomSampler(dataset, replacement=False)
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
