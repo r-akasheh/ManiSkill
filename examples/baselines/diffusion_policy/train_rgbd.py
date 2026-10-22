@@ -55,10 +55,10 @@ class Args:
     capture_video: bool = True
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
-    env_id: str = "PegInsertionSide-v1"
+    env_id: str = "PickCube-v1"
     """the id of the environment"""
     demo_path: str = (
-        "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
+        "data/datasets/pickcube_affine_rerendered/diffusion_trajectories.h5"
     )
     """the path of demo dataset, it is expected to be a ManiSkill dataset h5py format file"""
     num_demos: Optional[int] = None
@@ -71,10 +71,10 @@ class Args:
     # Diffusion Policy specific arguments
     lr: float = 1e-4
     """the learning rate of the diffusion policy"""
-    obs_horizon: int = 2  # Seems not very important in ManiSkill, 1, 2, 4 work well
+    obs_horizon: int = 16  # Seems not very important in ManiSkill, 1, 2, 4 work well
     act_horizon: int = 8  # Seems not very important in ManiSkill, 4, 8, 15 work well
     pred_horizon: int = (
-        16  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
+        64  # 16->8 leads to worse performance, maybe it is like generate a half image; 16->32, improvement is very marginal
     )
     diffusion_step_embed_dim: int = 64  # not very important
     unet_dims: List[int] = field(
@@ -85,9 +85,9 @@ class Args:
     )
 
     # Environment/experiment specific arguments
-    obs_mode: str = "rgb+depth"
+    obs_mode: str = "rgb"
     """The observation mode to use for the environment, which dictates what visual inputs to pass to the model. Can be "rgb", "depth", or "rgb+depth"."""
-    max_episode_steps: Optional[int] = None
+    max_episode_steps: Optional[int] = 100
     """Change the environments' max_episode_steps to this value. Sometimes necessary if the demonstrations being imitated are too short. Typically the default
     max episode steps of environments in ManiSkill are tuned lower so reinforcement learning agents can learn faster."""
     log_freq: int = 1000
@@ -104,7 +104,7 @@ class Args:
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
-    control_mode: str = "pd_joint_delta_pos"
+    control_mode: str = "pd_ee_delta_pos"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
@@ -125,8 +125,18 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
     def __init__(self, data_path, obs_process_fn, obs_space, include_rgb, include_depth, device, num_traj):
         self.include_rgb = include_rgb
         self.include_depth = include_depth
-        from diffusion_policy.utils import load_demo_dataset
-        trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
+        from diffusion_policy.utils import (
+            load_demo_dataset, load_flat_rgb_state_dataset, is_flat_rgb_state_h5,
+        )
+        # The project's affine-failure datasets store obs as flat rgb+state datasets
+        # rather than ManiSkill's nested raw-obs schema, so they need a custom loader
+        # that bypasses reorder_keys/convert_obs.
+        self._flat_schema = data_path.endswith(".h5") and is_flat_rgb_state_h5(data_path)
+        if self._flat_schema:
+            print("Detected flat rgb+state H5 schema — using custom loader (skipping convert_obs).")
+            trajectories = load_flat_rgb_state_dataset(data_path, num_traj=num_traj)
+        else:
+            trajectories = load_demo_dataset(data_path, num_traj=num_traj, concat=False)
         # trajectories['observations'] is a list of dict, each dict is a traj, with keys in obs_space, values with length L+1
         # trajectories['actions'] is a list of np.ndarray (L, act_dim)
         print("Raw trajectory loaded, beginning observation pre-processing...")
@@ -134,10 +144,14 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
         # Pre-process the observations, make them align with the obs returned by the obs_wrapper
         obs_traj_dict_list = []
         for obs_traj_dict in trajectories["observations"]:
-            _obs_traj_dict = reorder_keys(
-                obs_traj_dict, obs_space
-            )  # key order in demo is different from key order in env obs
-            _obs_traj_dict = obs_process_fn(_obs_traj_dict)
+            if self._flat_schema:
+                # Already in processed form: {"rgb": (L+1, C, H, W) uint8, "state": (L+1, D)}.
+                _obs_traj_dict = obs_traj_dict
+            else:
+                _obs_traj_dict = reorder_keys(
+                    obs_traj_dict, obs_space
+                )  # key order in demo is different from key order in env obs
+                _obs_traj_dict = obs_process_fn(_obs_traj_dict)
             if self.include_depth:
                 _obs_traj_dict["depth"] = torch.Tensor(
                     _obs_traj_dict["depth"].astype(np.float32)
@@ -379,6 +393,40 @@ class Agent(nn.Module):
         start = self.obs_horizon - 1
         end = start + self.act_horizon
         return noisy_action_seq[:, start:end]  # (B, act_horizon, act_dim)
+
+    def get_full_prediction(self, obs_seq):
+        """Like get_action but returns all pred_horizon denoised steps (no slice).
+
+        Returns (B, pred_horizon, act_dim). The first obs_horizon-1 steps overlap
+        with the conditioning window and are valid predictions — useful for VLM
+        narration where the world model imagines the full plan from step 0.
+        """
+        B = obs_seq["state"].shape[0]
+        with torch.no_grad():
+            if self.include_rgb:
+                obs_seq["rgb"] = obs_seq["rgb"].permute(0, 1, 4, 2, 3)
+            if self.include_depth:
+                obs_seq["depth"] = obs_seq["depth"].permute(0, 1, 4, 2, 3)
+
+            obs_cond = self.encode_obs(obs_seq, eval_mode=True)
+
+            noisy_action_seq = torch.randn(
+                (B, self.pred_horizon, self.act_dim), device=obs_seq["state"].device
+            )
+
+            for k in self.noise_scheduler.timesteps:
+                noise_pred = self.noise_pred_net(
+                    sample=noisy_action_seq,
+                    timestep=k,
+                    global_cond=obs_cond,
+                )
+                noisy_action_seq = self.noise_scheduler.step(
+                    model_output=noise_pred,
+                    timestep=k,
+                    sample=noisy_action_seq,
+                ).prev_sample
+
+        return noisy_action_seq  # (B, pred_horizon, act_dim)
 
 
 def save_ckpt(run_name, tag):

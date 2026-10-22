@@ -95,6 +95,71 @@ def load_traj_hdf5(path, num_traj=None):
     return ret
 
 
+def is_flat_rgb_state_h5(path):
+    """True if the H5 uses the project's flat schema produced by
+    vlm_diffusion_guidance.cli.generate_affine_failures, where each trajectory
+    stores ``obs/rgb`` and ``obs/state`` directly as datasets, rather than
+    ManiSkill's nested raw-observation schema (``obs/sensor_data/...``,
+    ``obs/agent/...``, ``obs/extra/...``).
+    """
+    file = File(path, "r")
+    try:
+        first = sorted(file.keys(), key=lambda k: int(k.split("_")[-1]))[0]
+        obs = file[first]["obs"]
+        return isinstance(obs, Group) and "rgb" in obs and isinstance(obs["rgb"], Dataset)
+    finally:
+        file.close()
+
+
+def load_flat_rgb_state_dataset(path, num_traj=None):
+    """Custom loader for the project's flat affine-failure H5 schema.
+
+    Each trajectory group is expected to contain::
+
+        obs/rgb   (L+1, H, W, 3) uint8
+        obs/state (L+1, D)        float32
+        actions   (L, A)          float32
+
+    Returns the same structure ``SmallDemoDataset_DiffusionPolicy`` consumes when
+    called with ``concat=False`` (i.e. before the per-trajectory tensor/device
+    conversion), but with observations already in the *processed* form that
+    ``convert_obs`` would otherwise produce::
+
+        {
+          "observations": [ {"rgb": (L+1, C, H, W) uint8, "state": (L+1, D) float32}, ... ],
+          "actions":      [ (L, A) float32, ... ],
+        }
+
+    RGB is transposed HWC -> CHW so that, after slicing into (obs_horizon, C, H, W)
+    and batching, it matches the (B, obs_horizon, C, H, W) layout that
+    ``Agent.encode_obs`` consumes at train time (mirroring ``convert_obs``'s
+    ``transpose_fn=np.transpose(axes=(0, 3, 1, 2))``). This loader deliberately
+    keeps every trajectory, including failures, so the resulting policy reproduces
+    a mix of success and failure rollouts.
+    """
+    file = File(path, "r")
+    try:
+        keys = sorted(file.keys(), key=lambda k: int(k.split("_")[-1]))
+        if num_traj is not None:
+            assert num_traj <= len(keys), f"num_traj: {num_traj} > len(keys): {len(keys)}"
+            keys = keys[:num_traj]
+        observations, actions = [], []
+        for k in keys:
+            g = file[k]
+            rgb = np.transpose(g["obs"]["rgb"][()], (0, 3, 1, 2))  # (L+1, C, H, W)
+            state = g["obs"]["state"][()].astype(np.float32)        # (L+1, D)
+            act = g["actions"][()].astype(np.float32)               # (L, A)
+            assert state.shape[0] == act.shape[0] + 1, (
+                f"{k}: obs len {state.shape[0]} != actions len {act.shape[0]} + 1"
+            )
+            observations.append({"rgb": rgb, "state": state})
+            actions.append(act)
+    finally:
+        file.close()
+    print(f"Loaded {len(observations)} trajectories (flat rgb+state schema) from {path}")
+    return {"observations": observations, "actions": actions}
+
+
 def load_demo_dataset(
     path, keys=["observations", "actions"], num_traj=None, concat=True
 ):
